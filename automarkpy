@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+
+import argparse
+import configparser
+import threading
+import curses
+import csv
+import traceback
+import concurrent.futures
+
+from machine import MachineInfo
+from linux import LinuxShell
+from windows import WindowsShell
+from cisco import CiscoShell
+from datetime import datetime
+from os import mkdir,cpu_count
+from os.path import dirname
+from time import sleep
+
+run_hosts = []
+
+def main():
+
+    global DEFAULT_USER
+    global DEFAULT_PASSWORD
+    global DEFAULT_PLATFORM
+
+    global HOSTS
+    global MACHINES
+    global RELATIVE_PATH
+
+    parser = argparse.ArgumentParser(description="Used for testing remote machines configuration and connectivity is right.")
+    parser.add_argument("config", type=str,
+                        help="config file path")
+    parser.add_argument("-H","--hosts", metavar="HOSTNAME,HOSTNAME,...", type=str,
+                        help="test only specified workplaces" )
+    parser.add_argument("-m","--machines", metavar="MACHINE,MACHINE,...", type=str,
+                        help="test only specified machines" )
+    parser.add_argument("-w","--max-workers", metavar="COUNT", type=int,
+                        help="maximum amount of workers allowed" )
+    parser.add_argument("--no-gui", action='store_true',
+                        help="don't run pseudo gui" )
+    parser.add_argument("--no-report", action='store_true',
+                        help="don't make a report" )
+
+    args = parser.parse_args()
+    
+    RELATIVE_PATH = dirname(args.config) + "/"
+
+    config = configparser.ConfigParser(default_section="generic")
+    config.read_string("[generic]\n"+open(args.config,"r").read())
+
+    DEFAULT_USER = config.get("generic","user",fallback="")
+    DEFAULT_PASSWORD = config.get("generic","password",fallback="")
+    DEFAULT_PLATFORM = config.get("generic","platform",fallback="")
+
+    if "hosts" in config["generic"]:
+        HOSTS = config.get("generic","hosts").split()
+        
+    if args.hosts:
+        desired_hosts = args.hosts.split(",")
+        for hostname in desired_hosts:
+            if hostname not in HOSTS:
+                print(f"Can't find host '{hostname}' specified")
+                return
+        HOSTS = desired_hosts   
+        
+    MACHINES = config.sections()
+
+    if args.machines:
+        desired_machines = args.machines.split(",")
+        for machine in desired_machines:
+            if machine not in MACHINES:
+                print(f"Can't find machine {machine} specified")
+                return
+        MACHINES = desired_machines
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=(args.max_workers or cpu_count()*8))
+    for hostname in HOSTS:
+        run_machines = []
+        for machinename in MACHINES:
+            machine = MachineInfo(hostname,machinename)
+            machine.config = config[machinename]
+            machine.useprint = args.no_gui
+            machine.future = executor.submit(TestingThread,machine)
+            run_machines.append(machine)
+        run_hosts.append(run_machines)
+
+    if not args.no_gui:
+        curses.wrapper(draw_menu,executor)
+
+    executor.shutdown(True)
+
+    if args.no_report:
+        return
+
+    print("Generating report")
+
+    try:
+        mkdir("reports")
+    except:
+        pass
+
+    csvfile = open("reports/report-{}.csv"
+                   .format(datetime.today().strftime("%Y-%m-%d-%H-%M-%S")), "w", newline="")
+
+    csvwriter = csv.writer(csvfile, quoting = csv.QUOTE_ALL, delimiter=",")
+
+    for i,machines in enumerate(run_hosts):
+        csvwriter.writerow([])
+        csvwriter.writerow([HOSTS[i]])
+        csvwriter.writerow([])
+        for machine in machines:
+            res = machine.result
+            if type(res) != int:
+                print("-------------------")
+                print(res)
+                print(f"WARNING: Machine {machine.globalname()} finished with error")
+                res = -1
+            row = list(("{:0"+machine.config["maximumpoints"]+"b}")
+                        .format(res))
+            if res != -1:
+                row.reverse()
+            csvwriter.writerow([machine.name]+row)
+    
+    print("Done")
+
+    return 0 
+
+
+def TestingThread(machine):
+    conf = machine.config
+    telshell = None
+    try:
+        clss = conf.get("platform",DEFAULT_PLATFORM)
+        if clss == "linux":
+            clss = LinuxShell
+        elif clss == "windows":
+            clss = WindowsShell
+        else:
+            clss = CiscoShell
+
+        telshell = clss(conf.get("host",machine.host), conf["port"])
+        telshell.info_obj(machine)
+
+        if telshell.login(conf.get("user",DEFAULT_USER),
+                          conf.get("password",DEFAULT_PASSWORD),
+                          DEFAULT_PASSWORD):
+            remotename = telshell.send_executable(RELATIVE_PATH+conf["script"])
+            telshell.execute(remotename)
+        else:
+            raise Exception("Can't login")
+    except Exception as exception:
+        machine.output = f"ERROR: {str(exception)}"
+        machine.result = traceback.format_exc()
+        return
+
+    return
+
+def draw_menu(stdscr,executor):
+    curses.curs_set(0)
+
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLACK) # Normal Text
+    curses.init_pair(2, curses.COLOR_BLUE, curses.COLOR_BLACK) # Title
+    curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_BLACK) # Not Selected
+    curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_BLUE) # Selected
+
+    offsetx = 2
+    offsety = 1
+
+    crun_hosts = len(run_hosts)
+
+    selx = 0 if crun_hosts == 1 else -1
+    sely = 0
+
+    k = 0
+
+    stdscr.nodelay(True)
+    stdscr.clear()
+
+    while k != ord('q'):
+        #General status section
+        if selx == -1:
+            stdscr.addstr(0,1, "All hosts - Done Active Failed / Total", curses.color_pair(2))
+            stdscr.clrtoeol()
+
+            for i,host in enumerate(run_hosts):
+                done,active,failed,total = 0,0,0,len(host)
+                for machine in host:
+                    if machine.future.done():
+                        if type(machine.result) != int:
+                            failed += 1
+                        else:
+                            done += 1
+                    if machine.future.running():
+                        active += 1
+                stdscr.addstr(offsetx+i,offsety, 
+                            f"{i+1}. {HOSTS[i]} - D:{done} A:{active} F:{failed} / {total}", curses.color_pair(1))
+                stdscr.clrtoeol()
+        else:
+            stdscr.addstr(0,1, f"Host #{selx+1} '{HOSTS[selx]}' details", curses.color_pair(2))
+            stdscr.clrtoeol()
+
+            for i,machine in enumerate(run_hosts[selx]):
+                stdscr.addstr(offsetx+i,offsety, 
+                            f"{i+1}. {machine.name} - {machine.output}", curses.color_pair(sely == i and 4 or 1))
+                stdscr.clrtoeol()
+
+        mlines,_ = stdscr.getmaxyx()
+        mlines -= 2
+
+        stdscr.addstr(mlines-1, 1, "Press q to detach and wait until completion",curses.color_pair(3))
+        stdscr.clrtoeol()
+
+        x = 1
+
+        for i in range(-1,crun_hosts):
+            str = f"{i+1}"
+            if i == -1:
+                str = "Home"
+            stdscr.addstr(mlines, x, str,curses.color_pair(selx == i and 4 or 3))
+            x += len(str) + 1
+        
+        stdscr.clrtoeol()
+
+        if k != -1:
+
+            stdscr.clear()
+
+            if k == curses.KEY_LEFT:
+                selx = max(selx - 1,-1)
+                sely = 0
+            elif k == curses.KEY_RIGHT:
+                selx = min(selx + 1,len(run_hosts)-1)
+                sely = 0
+            elif selx == -1: # Prevent selection on home menu
+                pass
+            elif k == curses.KEY_UP:
+                sely = max(0,sely-1)
+            elif k == curses.KEY_DOWN:
+                sely = min(len(run_hosts[selx])-1,sely+1)
+            elif k == curses.KEY_ENTER or k == 10 or k == 13 or k == ord(' '):
+                machine = run_hosts[selx][sely]
+                machine.output = "Cancel pending"
+                if not machine.future.running():
+                    machine.future.cancel()
+                    machine.future = executor.submit(TestingThread,run_hosts[selx][sely])
+                else:
+                    machine.cancel = True
+                    machine.future.result()
+                    machine.cancel = False
+
+
+
+        stdscr.refresh()
+
+        k = stdscr.getch()
+
+    curses.curs_set(1)
+    
+    
+if __name__ == "__main__":
+    main()
